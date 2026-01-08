@@ -118,8 +118,8 @@ async function autoDetectPort() {
 	// Serve static files from the 'dist' directory
 	app.use(express.static(path.join(__dirname, 'dist')));
 
-	// Handle all other requests by sending index.html
-
+	// Serve Nexmosphere WebSocket test client
+	app.use('/nextest', express.static(path.join(__dirname, 'nextest')));
 
 	app.get('/playmist', async (req, res) => {
 		await sound.play(mistpath);
