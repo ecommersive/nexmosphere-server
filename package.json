@@ -10,6 +10,7 @@
   "description": "",
   "dependencies": {
     "audic": "^3.0.2",
+    "cors": "^2.8.5",
     "express": "^4.19.2",
     "nodemon": "^3.1.4",
     "serialport": "^12.0.0",
