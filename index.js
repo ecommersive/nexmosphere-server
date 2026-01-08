@@ -21,8 +21,11 @@ app.use(express.json());
 
 let port;
 
-// Function to auto-detect the serial port
-async function autoDetectPort() {
+// Get COM port from command line argument (e.g., "bun index.js 4" for COM4)
+const comPortArg = process.argv[2];
+
+// Function to get or auto-detect the serial port
+async function getSerialPort() {
 	const ports = await SerialPort.list();
 
 	if (ports.length === 0) {
@@ -30,10 +33,30 @@ async function autoDetectPort() {
 		process.exit(1);
 	}
 
-	// Assuming you want the first available port or you can add more sophisticated logic here
-	const selectedPort = ports[0].path; // Example: Automatically selecting the first port
+	let selectedPort;
 
-	console.log(`Selected port: ${selectedPort}`);
+	if (comPortArg) {
+		// User specified a COM port number
+		const targetPath = process.platform === 'win32' 
+			? `COM${comPortArg}` 
+			: `/dev/ttyUSB${comPortArg}`; // Linux/Mac fallback
+		
+		const found = ports.find(p => p.path === targetPath || p.path.endsWith(comPortArg));
+		
+		if (found) {
+			selectedPort = found.path;
+		} else {
+			console.error(`Port ${targetPath} not found. Available ports:`);
+			ports.forEach(p => console.log(`  - ${p.path} (${p.friendlyName || p.manufacturer || 'Unknown'})`));
+			process.exit(1);
+		}
+	} else {
+		// Auto-detect: use first available port
+		selectedPort = ports[0].path;
+		console.log('No port specified, auto-detecting...');
+	}
+
+	console.log(`Using port: ${selectedPort}`);
 
 	return new SerialPort({
 		path: selectedPort,
@@ -42,7 +65,7 @@ async function autoDetectPort() {
 }
 
 (async () => {
-	port = await autoDetectPort();
+	port = await getSerialPort();
 	const parser = port.pipe(new ReadlineParser({ delimiter: '\r\n' }));
 
 	// Rate-limited command queue (1 command per 300ms)
