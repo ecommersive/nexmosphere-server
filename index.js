@@ -9,7 +9,7 @@ const mistpath = path.join(__dirname, 'sounds', "mist.wav");
 const maskpath = path.join(__dirname, 'sounds', "mask.wav");
 // Define CORS options
 const corsOptions = {
-	origin: 'http://localhost:3000', // Replace with your frontend URL
+	origin: 'http://localhost:3001', // Replace with your frontend URL
 	methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Allowed methods
 	credentials: true, // Allow cookies and authorization headers
 	optionsSuccessStatus: 204, // For legacy browser support
@@ -74,6 +74,40 @@ async function getSerialPort() {
 	let isProcessingQueue = false;
 	let lastCommandTime = 0;
 
+	// Store all connected WebSocket clients
+	const connectedClients = new Set();
+
+	// Log port events for debugging
+	port.on('open', () => {
+		console.log('[PORT] Serial port opened successfully');
+		console.log(`[PORT] Settings: ${port.baudRate} baud, ${port.dataBits} data bits, ${port.stopBits} stop bits, parity: ${port.parity}`);
+	});
+
+	port.on('error', (err) => {
+		console.error(`[PORT-ERROR] Serial port error: ${err.message}`);
+	});
+
+	port.on('close', () => {
+		console.log('[PORT] Serial port closed');
+	});
+
+	// Listen for data from serial port at the top level
+	parser.on('data', (data) => {
+		console.log(`[SERIAL-IN] Data received from serial port: "${data}"`);
+		
+		// Broadcast to all connected WebSocket clients
+		connectedClients.forEach((client) => {
+			if (client.readyState === 1) { // 1 = OPEN
+				console.log(`[WEBSOCKET-BROADCAST] Sending to client: "${data}"`);
+				client.send(data);
+			}
+		});
+	});
+
+	parser.on('error', (err) => {
+		console.error(`[PARSER-ERROR] Parser error: ${err.message}`);
+	});
+
 	function processQueue() {
 		if (isProcessingQueue || commandQueue.length === 0) return;
 		isProcessingQueue = true;
@@ -88,9 +122,10 @@ async function getSerialPort() {
 
 			port.write(command, (err) => {
 				if (err) {
+					console.error(`[ERROR] Failed to send command: "${command.trim()}" | Error: ${err.message}`);
 					reject('Error sending command: ' + err.message);
 				} else {
-					console.log('Command sent (rate-limited):', command.trim());
+					console.log(`[SENT] Command sent to serial port: "${command.trim()}"`);
 					resolve({ success: true, command: command.trim() });
 				}
 				isProcessingQueue = false;
@@ -102,7 +137,7 @@ async function getSerialPort() {
 	function queueCommand(command) {
 		return new Promise((resolve, reject) => {
 			commandQueue.push({ command, resolve, reject });
-			console.log(`Command queued. Queue length: ${commandQueue.length}`);
+			console.log(`[QUEUE] Command queued: "${command.trim()}" | Queue length: ${commandQueue.length}`);
 			processQueue();
 		});
 	}
@@ -112,15 +147,16 @@ async function getSerialPort() {
 			// Send the command to the serial port
 			port.write(command, (err) => {
 				if (err) {
+					console.error(`[ERROR] Failed to send command: "${command.trim()}" | Error: ${err.message}`);
 					return reject('Error sending command: ' + err.message);
 				}
-				console.log('Command sent:', command);
+				console.log(`[SENT] Command sent: "${command.trim()}"`);
 			});
 
 			// Listen for data from the serial port
 			const parser = port.pipe(new ReadlineParser({ delimiter: '\r\n' }));
 			parser.once('data', (response) => {
-				console.log('Response received:', response);
+				console.log(`[RESPONSE] Response received: "${response}"`);
 				resolve(response);
 			});
 		});
@@ -138,8 +174,6 @@ async function getSerialPort() {
 		}
 	}
 
-	// Serve static files from the 'dist' directory
-	app.use(express.static(path.join(__dirname, 'dist')));
 
 	// Serve Nexmosphere WebSocket test client
 	app.use('/nextest', express.static(path.join(__dirname, 'nextest')));
@@ -158,14 +192,18 @@ async function getSerialPort() {
 	app.post('/send-command', async (req, res) => {
 		const { command } = req.body;
 		if (!command) {
+			console.warn('[WARN] POST /send-command received without command parameter');
 			return res.status(400).json({ error: 'Command is required' });
 		}
 		try {
+			console.log(`[INCOMING] POST /send-command received: "${command}"`);
 			// Ensure command ends with \r\n for Nexmosphere protocol
 			const formattedCommand = command.endsWith('\r\n') ? command : command + '\r\n';
 			const result = await queueCommand(formattedCommand);
+			console.log(`[SUCCESS] Command processed: "${command}"`);
 			res.json(result);
 		} catch (error) {
+			console.error(`[ERROR] POST /send-command failed: "${command}" | Error: ${error.toString()}`);
 			res.status(500).json({ error: error.toString() });
 		}
 	});
@@ -209,19 +247,24 @@ async function getSerialPort() {
 
 	const wss = new WebSocketServer({ server });
 	wss.on('connection', (ws) => {
-		console.log('Client connected via WebSocket');
-		parser.on('data', (data) => {
-			console.log('Data received: ', data);
-			ws.send(data);
+		console.log('[WEBSOCKET] Client connected via WebSocket');
+		connectedClients.add(ws);
+
+		ws.on('message', (message) => {
+			console.log(`[WEBSOCKET-MESSAGE] Message received from client: "${message}"`);
 		});
 
 		ws.on('close', () => {
-			console.log('Client disconnected');
+			console.log('[WEBSOCKET] Client disconnected');
+			connectedClients.delete(ws);
+		});
+
+		ws.on('error', (error) => {
+			console.error(`[WEBSOCKET-ERROR] WebSocket error: ${error.message}`);
+			connectedClients.delete(ws);
 		});
 	});
-	app.get('*', (req, res) => {
-		res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-	});
+
 	// Serve the HTML file
 	app.use(express.static(path.join(__dirname, 'public')));
 })();

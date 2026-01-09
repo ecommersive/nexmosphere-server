@@ -39,7 +39,7 @@ function updateStatus(connected) {
 
 function connect() {
 	const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-	const wsUrl = `${protocol}//${window.location.host}`;
+	const wsUrl = `${protocol}//${window.location.host}/ws`;
 	
 	addLog(`Connecting to ${wsUrl}...`, 'info');
 	
