@@ -13,6 +13,7 @@ import os
 from datetime import datetime
 from typing import Set
 from aiohttp import web
+import aiohttp_cors
 
 # Configuration
 SERIAL_PORT = 'COM4'  # Change this to your COM port
@@ -20,6 +21,10 @@ BAUD_RATE = 115200
 WEBSOCKET_HOST = 'localhost'
 WEBSOCKET_PORT = 3001
 RATE_LIMIT_MS = 300  # 300ms between commands
+
+# TUIO Configuration
+TUIO_HOST = '0.0.0.0'  # Listen on all interfaces
+TUIO_PORT = 3333       # Standard TUIO port
 
 # Store connected clients
 connected_clients: Set = set()
@@ -241,14 +246,149 @@ async def nextest_handler(request):
     return web.Response(text='nextest/index.html not found', status=404)
 
 
+class TUIOProtocol(asyncio.DatagramProtocol):
+    """
+    UDP Protocol handler for TUIO messages (OSC format)
+    """
+    def __init__(self):
+        self.transport = None
+    
+    def connection_made(self, transport):
+        self.transport = transport
+        print(f'[TUIO] UDP listener ready on port {TUIO_PORT}')
+    
+    def datagram_received(self, data, addr):
+        """
+        Parse incoming TUIO/OSC data and broadcast to WebSocket clients
+        """
+        try:
+            messages = self.parse_osc_bundle(data)
+            if messages:
+                asyncio.create_task(self.broadcast_tuio(messages))
+        except Exception as e:
+            print(f'[TUIO-ERROR] Failed to parse: {e}')
+    
+    def parse_osc_bundle(self, data):
+        """
+        Parse OSC bundle/message format used by TUIO
+        Returns list of parsed TUIO messages
+        """
+        messages = []
+        try:
+            # Check for OSC bundle header "#bundle"
+            if data.startswith(b'#bundle'):
+                # Skip bundle header (8 bytes) + timetag (8 bytes)
+                offset = 16
+                while offset < len(data):
+                    if offset + 4 > len(data):
+                        break
+                    # Read message size (4 bytes, big-endian)
+                    msg_size = int.from_bytes(data[offset:offset+4], 'big')
+                    offset += 4
+                    if offset + msg_size > len(data):
+                        break
+                    msg_data = data[offset:offset+msg_size]
+                    parsed = self.parse_osc_message(msg_data)
+                    if parsed:
+                        messages.append(parsed)
+                    offset += msg_size
+            else:
+                # Single OSC message
+                parsed = self.parse_osc_message(data)
+                if parsed:
+                    messages.append(parsed)
+        except Exception as e:
+            print(f'[TUIO-PARSE] Error: {e}')
+        
+        return messages
+    
+    def parse_osc_message(self, data):
+        """
+        Parse a single OSC message
+        Returns dict with address and arguments
+        """
+        try:
+            # Find null terminator for address
+            null_idx = data.index(b'\x00')
+            address = data[:null_idx].decode('utf-8')
+            
+            # Align to 4 bytes
+            offset = (null_idx + 4) & ~3
+            
+            # Find type tag string (starts with ',')
+            if offset < len(data) and data[offset:offset+1] == b',':
+                type_end = data.index(b'\x00', offset)
+                type_tags = data[offset+1:type_end].decode('utf-8')
+                offset = (type_end + 4) & ~3
+                
+                # Parse arguments based on type tags
+                args = []
+                for tag in type_tags:
+                    if tag == 'i':  # int32
+                        if offset + 4 <= len(data):
+                            val = int.from_bytes(data[offset:offset+4], 'big', signed=True)
+                            args.append(val)
+                            offset += 4
+                    elif tag == 'f':  # float32
+                        if offset + 4 <= len(data):
+                            import struct
+                            val = struct.unpack('>f', data[offset:offset+4])[0]
+                            args.append(round(val, 4))
+                            offset += 4
+                    elif tag == 's':  # string
+                        str_end = data.index(b'\x00', offset)
+                        val = data[offset:str_end].decode('utf-8')
+                        args.append(val)
+                        offset = (str_end + 4) & ~3
+                
+                return {'address': address, 'args': args}
+        except Exception as e:
+            pass
+        return None
+    
+    async def broadcast_tuio(self, messages):
+        """
+        Broadcast parsed TUIO messages to WebSocket clients
+        """
+        if not connected_clients:
+            return
+        
+        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        
+        # Process TUIO messages into a cleaner format
+        tuio_data = {
+            'timestamp': timestamp,
+            'type': 'tuio_data',
+            'messages': messages
+        }
+        
+        # Log cursor/object data (filter out alive/fseq messages for cleaner logs)
+        for msg in messages:
+            addr = msg.get('address', '')
+            if '/tuio/2Dcur' in addr or '/tuio/2Dobj' in addr:
+                args = msg.get('args', [])
+                if args and args[0] == 'set':
+                    print(f'[TUIO-IN] {timestamp} - {addr} {args}')
+        
+        disconnected = set()
+        for client in connected_clients:
+            try:
+                await client.send_json(tuio_data)
+            except Exception as e:
+                disconnected.add(client)
+        
+        connected_clients.difference_update(disconnected)
+
+
 async def main():
     """
     Main function - run serial reader and HTTP/WebSocket server
     """
-    print(f'[STARTUP] Serial Monitor with WebSocket')
+    print(f'[STARTUP] Serial Monitor with WebSocket + TUIO')
     print(f'[STARTUP] Serial Port: {SERIAL_PORT}')
     print(f'[STARTUP] Baud Rate: {BAUD_RATE}')
     print(f'[STARTUP] Rate Limit: {RATE_LIMIT_MS}ms between commands')
+    print(f'[STARTUP] TUIO UDP: {TUIO_HOST}:{TUIO_PORT}')
     print(f'[STARTUP] HTTP/WebSocket Server: http://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}')
     print(f'[STARTUP] WebSocket: ws://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}/ws')
     print(f'[STARTUP] Test Client: http://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}/nextest')
@@ -262,6 +402,20 @@ async def main():
     app.router.add_get('/ws', websocket_handler)
     app.router.add_post('/send-command', send_command_handler)
     app.router.add_get('/queue-status', queue_status_handler)
+    
+    # Setup CORS for all routes (allow any origin for local development)
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+    
+    # Apply CORS to all routes
+    for route in list(app.router.routes()):
+        cors.add(route)
     
     # Serve static files from nextest directory first
     nextest_path = os.path.join(os.path.dirname(__file__), 'nextest')
@@ -288,6 +442,14 @@ async def main():
     # Load commands from file
     await load_and_queue_commands()
     
+    # Start TUIO UDP listener
+    loop = asyncio.get_event_loop()
+    tuio_transport, tuio_protocol = await loop.create_datagram_endpoint(
+        lambda: TUIOProtocol(),
+        local_addr=(TUIO_HOST, TUIO_PORT)
+    )
+    print(f'[TUIO] Listening for TUIO on UDP port {TUIO_PORT}')
+    
     # Create tasks
     serial_reader_task = asyncio.create_task(serial_reader(ser))
     command_processor_task = asyncio.create_task(process_command_queue(ser))
@@ -297,6 +459,7 @@ async def main():
         await asyncio.gather(serial_reader_task, command_processor_task)
     except KeyboardInterrupt:
         print('\n[SHUTDOWN] Shutting down...')
+        tuio_transport.close()
         await runner.cleanup()
         ser.close()
 
